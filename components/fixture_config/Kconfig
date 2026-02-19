@@ -1,0 +1,42 @@
+menu "LatchPac Fixture Config"
+
+    config LATCHPAC_MOCK_HARDWARE
+        bool "Enable Mock Hardware Mode (NO live 120VAC testing)"
+        default y
+        help
+            When enabled, the fixture runs in software-only self-test mode.
+            All SWD verification and load sensing are replaced by mock stubs.
+
+            DISABLE THIS FOR PRODUCTION BUILDS WITH LIVE 120VAC HARDWARE.
+
+            A warning banner will print at boot when mock mode is active.
+
+    config LATCHPAC_SWD_ISOLATED
+        bool "SWD is opto-isolated (6N137 optocouplers)"
+        default n
+        depends on !LATCHPAC_MOCK_HARDWARE
+        help
+            Enable this if the LatchPac GND is mains-referenced and you
+            have installed 6N137 optocouplers on the SWD lines.
+
+            When enabled, the SWD driver uses split GPIOs for SWDIO:
+              - PIN_SWD_IO_OUT (GPIO 16): host-to-target via 6N137 #2
+              - PIN_SWD_IO_IN  (GPIO 18): target-to-host via 6N137 #3
+
+            When disabled (default), SWDIO uses a single bidirectional
+            GPIO (GPIO 16) for direct-wire SWD connection.
+
+            Only applicable in production mode (mock mode ignores this).
+
+    config LATCHPAC_SWD_VERBOSE
+        bool "Enable verbose SWD debug logging"
+        default y
+        depends on !LATCHPAC_MOCK_HARDWARE
+        help
+            When enabled, the SWD driver prints detailed diagnostic info
+            at every step: GPIO init states, line reset, JTAG-to-SWD switch,
+            ACK bits, raw IDCODE, transfer results.
+
+            Disable this for production to reduce serial output.
+
+endmenu

@@ -1,0 +1,18 @@
+# LatchPac Validator 3000 -- Default Configuration
+#
+# Mock mode is ON by default.  This ensures that a fresh build
+# will NEVER accidentally control live 120 VAC hardware.
+#
+# To switch to production mode:
+#   idf.py menuconfig -> LatchPac Fixture Config -> disable Mock Hardware Mode
+#
+CONFIG_LATCHPAC_MOCK_HARDWARE=y
+
+# ESP32-S3 target
+CONFIG_IDF_TARGET="esp32s3"
+
+# Use 240 MHz for snappy SWD bit-bang timing
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Task watchdog: 10 second timeout (generous for SWD retries)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
