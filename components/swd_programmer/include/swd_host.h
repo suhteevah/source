@@ -158,4 +158,45 @@ swd_status_t swd_read_idcode_value(uint32_t *idcode);
  */
 swd_status_t swd_integrity_test(int iterations, int *pass_count, int *fail_count);
 
+/* ------------------------------------------------------------------ */
+/*  v3 API: Production hardening                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Detailed SWD verification result for granular error reporting.
+ */
+typedef struct {
+    swd_status_t status;        /* SWD_OK on match, specific error otherwise  */
+    uint32_t     idcode;        /* Actual IDCODE value read (0 if unreadable) */
+    int          attempts;      /* How many attempts were made (1..MAX)       */
+} swd_verify_result_t;
+
+/**
+ * @brief Verify the SWD target with detailed result reporting.
+ *
+ * Same retry logic as swd_verify_target() but returns the full
+ * diagnostic picture instead of just true/false.
+ *
+ * @return swd_verify_result_t with status, idcode, and attempt count.
+ */
+swd_verify_result_t swd_verify_target_detailed(void);
+
+/**
+ * @brief Force all SWD GPIO lines to a safe idle state.
+ *
+ * Call this after every test (pass or fail) and on safety aborts.
+ * Sets: SWCLK=idle, SWDIO=input with pullup, nRST=deasserted.
+ */
+void swd_safe_state(void);
+
+/**
+ * @brief Clear all sticky error flags by writing ABORT register,
+ *        then perform a line reset to re-synchronise the SWD bus.
+ *
+ * Call this after ACK FAULT or protocol errors before retrying.
+ *
+ * @return SWD_OK if ABORT write succeeded, error code otherwise.
+ */
+swd_status_t swd_abort_recovery(void);
+
 #endif /* SWD_HOST_H */

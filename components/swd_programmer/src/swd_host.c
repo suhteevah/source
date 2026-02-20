@@ -51,6 +51,16 @@
 #define SWD_RETRY_MS    50      /* Delay between retries                 */
 #define SWD_IDLE_CYCLES 4       /* Extra idle clocks after transactions  */
 #define SWD_WAIT_RETRIES 8      /* Max retries on WAIT ACK              */
+#define SWD_WAIT_TIMEOUT_US 200000  /* 200ms wall-clock max for WAIT loop */
+
+/* ABORT register bits -- write to DP addr 0x00 to clear sticky errors */
+#define ABORT_ORUNERRCLR  (1u << 4)
+#define ABORT_WDERRCLR    (1u << 3)
+#define ABORT_STKERRCLR   (1u << 2)
+#define ABORT_STKCMPCLR   (1u << 1)
+#define ABORT_DAPABORT    (1u << 0)
+#define ABORT_CLEAR_ALL   (ABORT_ORUNERRCLR | ABORT_WDERRCLR | \
+                           ABORT_STKERRCLR | ABORT_STKCMPCLR | ABORT_DAPABORT)
 
 /*
  * In isolated mode the optocoupler propagation delay (~100 ns for
@@ -277,6 +287,9 @@ static swd_status_t swd_transfer(uint8_t request, uint32_t *data)
     SWD_LOG("xfer: req=0x%02X %s %s addr=0x%02X",
             request, APnDP ? "AP" : "DP", RnW ? "RD" : "WR", addr);
 
+    /* Wall-clock deadline prevents infinite hang on WAIT storms */
+    int64_t deadline = esp_timer_get_time() + SWD_WAIT_TIMEOUT_US;
+
     for (int wait_retry = 0; wait_retry < SWD_WAIT_RETRIES; wait_retry++) {
 
         /* --- Send 8-bit request (LSB first) --- */
@@ -350,23 +363,55 @@ static swd_status_t swd_transfer(uint8_t request, uint32_t *data)
                 return SWD_OK;
             }
         } else if (ack == 0x02) {
-            /* WAIT -- retry after restoring bus */
+            /* WAIT -- retry after restoring bus, but respect wall-clock */
             SWD_LOG("xfer: WAIT retry %d/%d", wait_retry+1, SWD_WAIT_RETRIES);
             swdio_set_output_mode();
             swd_idle_cycles(SWD_IDLE_CYCLES);
             esp_rom_delay_us(100);
+            if (esp_timer_get_time() > deadline) {
+                SWD_LOG("xfer: WAIT wall-clock timeout (%d us)", SWD_WAIT_TIMEOUT_US);
+                return SWD_TIMEOUT;
+            }
             continue;
         } else if (ack == 0x04) {
-            /* FAULT */
-            SWD_LOG("xfer: FAULT");
+            /* FAULT -- clear sticky errors via ABORT before returning */
+            SWD_LOG("xfer: FAULT -- clearing via ABORT");
             swdio_set_output_mode();
             swd_idle_cycles(SWD_IDLE_CYCLES);
+            /* Inline ABORT write (can't call swd_abort_recovery here to avoid recursion) */
+            {
+                uint8_t abort_req = swd_request_byte(0, 0, DP_ABORT);
+                uint32_t abort_val = ABORT_CLEAR_ALL;
+                swdio_set_output_mode();
+                for (int i = 0; i < 8; i++)
+                    swd_write_bit((abort_req >> i) & 1);
+                /* Turnaround */
+                swdio_set_input_mode();
+                esp_rom_delay_us(SWD_ISO_DELAY_US);
+                gpio_set_level(PIN_SWD_CLK, CLK_ACTIVE);
+                esp_rom_delay_us(SWD_ISO_DELAY_US);
+                gpio_set_level(PIN_SWD_CLK, CLK_IDLE);
+                /* Read ACK (discard -- best effort) */
+                for (int i = 0; i < 3; i++) swd_read_bit();
+                /* Write the ABORT value */
+                swdio_set_output_mode();
+                swdio_write(0);
+                esp_rom_delay_us(SWD_ISO_DELAY_US);
+                gpio_set_level(PIN_SWD_CLK, CLK_ACTIVE);
+                esp_rom_delay_us(SWD_ISO_DELAY_US);
+                gpio_set_level(PIN_SWD_CLK, CLK_IDLE);
+                for (int i = 0; i < 32; i++)
+                    swd_write_bit((abort_val >> i) & 1);
+                swd_write_bit(parity32(abort_val));
+                swd_idle_cycles(SWD_IDLE_CYCLES);
+            }
             return SWD_ACK_FAULT;
         } else {
-            /* Protocol error — no valid ACK from target */
-            SWD_LOG("xfer: PROTOCOL ERROR ack=0x%02X (target not responding?)", ack);
+            /* Protocol error -- line reset to re-sync bus */
+            SWD_LOG("xfer: PROTOCOL ERROR ack=0x%02X -- doing line reset", ack);
             swdio_set_output_mode();
             swd_idle_cycles(SWD_IDLE_CYCLES);
+            swd_line_reset();
             return SWD_ERROR;
         }
     }
@@ -677,4 +722,83 @@ void swd_reset_target(void)
     gpio_set_level(PIN_SWD_NRST, NRST_DEASSERT);
     vTaskDelay(pdMS_TO_TICKS(10));
     SWD_LOG("reset_target: done, SWDIO level=%d", gpio_get_level(PIN_SWD_IO));
+}
+
+/* ================================================================== */
+/*  v3 API: Production hardening                                        */
+/* ================================================================== */
+
+void swd_safe_state(void)
+{
+    SWD_LOG("safe_state: restoring all SWD GPIOs to idle");
+    gpio_set_level(PIN_SWD_CLK, CLK_IDLE);
+#ifdef SWD_ISOLATED
+    gpio_set_level(PIN_SWD_IO_OUT, 0);
+#else
+    gpio_set_direction(PIN_SWD_IO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIN_SWD_IO, GPIO_PULLUP_ONLY);
+#endif
+    gpio_set_level(PIN_SWD_NRST, NRST_DEASSERT);
+    SWD_LOG("safe_state: done");
+}
+
+swd_status_t swd_abort_recovery(void)
+{
+    SWD_LOG("abort_recovery: clearing sticky errors + line reset");
+    swd_status_t st = swd_write_dp(DP_ABORT, ABORT_CLEAR_ALL);
+    swd_line_reset();
+    SWD_LOG("abort_recovery: done (ABORT write status=%d)", (int)st);
+    return st;
+}
+
+swd_verify_result_t swd_verify_target_detailed(void)
+{
+    swd_verify_result_t result = {
+        .status   = SWD_ERROR,
+        .idcode   = 0,
+        .attempts = 0
+    };
+
+    for (int attempt = 1; attempt <= SWD_MAX_RETRIES; attempt++) {
+        result.attempts = attempt;
+
+        swd_reset_target();
+        swd_line_reset();
+        swd_jtag_to_swd();
+        swd_line_reset();
+
+        uint32_t idcode = 0;
+        swd_status_t st = swd_read_dp(DP_DPIDR, &idcode);
+        result.idcode = idcode;
+        result.status = st;
+
+        if (st == SWD_OK && idcode == SWD_IDCODE_STM32G030) {
+            printf("INFO, SWD IDCODE OK: 0x%08lX (attempt %d/%d)\n",
+                   (unsigned long)idcode, attempt, SWD_MAX_RETRIES);
+            return result;
+        }
+
+        if (attempt < SWD_MAX_RETRIES) {
+            printf("INFO, SWD attempt %d/%d failed (ID=0x%08lX status=%d), retrying...\n",
+                   attempt, SWD_MAX_RETRIES,
+                   (unsigned long)idcode, st);
+            /* Try bus recovery before next attempt */
+            if (st == SWD_ACK_FAULT) {
+                swd_abort_recovery();
+            }
+            vTaskDelay(pdMS_TO_TICKS(SWD_RETRY_MS));
+        }
+    }
+
+    /* Classify the final failure reason */
+    if (result.status == SWD_OK && result.idcode != SWD_IDCODE_STM32G030) {
+        /* Got a valid SWD response but wrong chip ID */
+        printf("INFO, SWD WRONG IDCODE: got 0x%08lX, expected 0x%08lX\n",
+               (unsigned long)result.idcode, (unsigned long)SWD_IDCODE_STM32G030);
+    } else {
+        printf("INFO, SWD FAILED after %d attempts (status=%d idcode=0x%08lX)\n",
+               SWD_MAX_RETRIES, (int)result.status, (unsigned long)result.idcode);
+    }
+
+    return result;
 }

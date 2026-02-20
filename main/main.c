@@ -27,6 +27,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 
 #include "fixture_pins.h"
 #include "mock_hardware.h"
@@ -47,6 +48,7 @@
 #define NVS_NAMESPACE       "fixture"
 #define NVS_KEY_UNIT_ID     "unit_id"
 #define NVS_KEY_SESSION     "session_count"
+#define NVS_KEY_TEST_ACTIVE "test_active"
 
 /* ---------- State Machine ---------- */
 typedef enum {
@@ -59,6 +61,7 @@ static int              unit_counter   = 0;
 static int              session_count  = 0;
 static fixture_state_t  state          = STATE_IDLE;
 static const char      *fw_version_str = NULL;
+static bool             boot_test_was_interrupted = false;  /* v3: set by nvs_init */
 
 /* ------------------------------------------------------------------ */
 /*  NVS Persistent Storage                                              */
@@ -94,6 +97,18 @@ static void nvs_init_counters(void)
     nvs_get_i32(handle, NVS_KEY_UNIT_ID, &uid);
     unit_counter = (int)uid;
 
+    /* Check for interrupted test (power loss during STATE_TESTING) */
+    int32_t test_active = 0;
+    nvs_get_i32(handle, NVS_KEY_TEST_ACTIVE, &test_active);
+    if (test_active != 0) {
+        printf("INFO, *** WARNING: Previous test #%d was interrupted (power loss or crash) ***\n",
+               unit_counter);
+        printf("INFO, *** Unit #%d result UNKNOWN -- re-test required ***\n", unit_counter);
+        /* Clear the flag so we don't report it again next boot */
+        nvs_set_i32(handle, NVS_KEY_TEST_ACTIVE, 0);
+        boot_test_was_interrupted = true;
+    }
+
     nvs_commit(handle);
     nvs_close(handle);
 
@@ -105,6 +120,16 @@ static void nvs_save_unit_counter(void)
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
         nvs_set_i32(handle, NVS_KEY_UNIT_ID, (int32_t)unit_counter);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+static void nvs_set_test_active(bool active)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i32(handle, NVS_KEY_TEST_ACTIVE, active ? 1 : 0);
         nvs_commit(handle);
         nvs_close(handle);
     }
@@ -184,6 +209,9 @@ static void force_safe_state(void)
     gpio_set_level(PIN_SIM_START, 1);
     gpio_set_level(PIN_SIM_STOP,  1);
     leds_off();
+#ifndef MOCK_HARDWARE_MODE
+    swd_safe_state();     /* v3: restore SWD GPIOs to idle on abort */
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -249,6 +277,23 @@ void app_main(void)
     /* Print v2 CSV header */
     log_header_v2();
 
+    /* v3: Log INCOMPLETE entry for interrupted test detected on boot */
+    if (boot_test_was_interrupted) {
+        const char *incomplete_str = test_result_to_string(FAIL_INCOMPLETE);
+        log_entry_t entry = {
+            .unit_id          = unit_counter,
+            .status           = incomplete_str,
+            .voltage          = 0.0f,
+            .swd_idcode       = 0,
+            .swd_attempts     = 0,
+            .test_duration_ms = 0,
+            .fw_version       = fw_version_str
+        };
+        log_result_v2(&entry);
+        printf("INFO, Logged INCOMPLETE for unit #%d (interrupted by power loss/crash)\n",
+               unit_counter);
+    }
+
     printf("INFO, Fixture ready -- waiting for operator\n");
 
     /* ============================================================== */
@@ -260,6 +305,26 @@ void app_main(void)
         if (LID_IS_OPEN() && state == STATE_TESTING) {
             printf("INFO, SAFETY -- lid opened during test, aborting\n");
             force_safe_state();
+            nvs_set_test_active(false);
+
+            /* v3: Log the aborted test so it's traceable in CSV */
+            {
+                const char *abort_str = test_result_to_string(FAIL_SAFETY_OPEN);
+                float voltage = 0.0f;
+                log_entry_t entry = {
+                    .unit_id          = unit_counter,
+                    .status           = abort_str,
+                    .voltage          = voltage,
+                    .swd_idcode       = 0,
+                    .swd_attempts     = 0,
+                    .test_duration_ms = 0,
+                    .fw_version       = fw_version_str
+                };
+                log_result_v2(&entry);
+                printf("INFO, Unit %d ABORTED -- %s (lid opened mid-test)\n",
+                       unit_counter, abort_str);
+            }
+
             blink_led(PIN_STATUS_LED_R, 3, 100);
             state = STATE_IDLE;
             continue;
@@ -282,7 +347,10 @@ void app_main(void)
             gpio_set_level(PIN_STATUS_LED_G, 1);
             gpio_set_level(PIN_STATUS_LED_R, 1);
 
-            /* Run v2 test with full report */
+            /* v3: Mark test as active in NVS (survives power loss) */
+            nvs_set_test_active(true);
+
+            /* Run v2/v3 test with full report */
             test_report_t report = run_production_test_v2();
 
             /* Ensure pogo pins are safe */
@@ -310,6 +378,9 @@ void app_main(void)
                 .fw_version     = fw_version_str
             };
             log_result_v2(&entry);
+
+            /* v3: Clear test-active flag -- test completed normally */
+            nvs_set_test_active(false);
 
             if (report.result == TEST_PASS) {
                 gpio_set_level(PIN_STATUS_LED_G, 1);
